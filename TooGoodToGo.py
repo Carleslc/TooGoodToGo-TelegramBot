@@ -1,10 +1,12 @@
 import json
 import time
+from configparser import SectionProxy
 
 from pathlib import Path
 from _thread import start_new_thread
-from datetime import datetime
+from datetime import datetime, timedelta
 from pytz import timezone, utc
+from babel.numbers import format_currency
 
 import tgtg
 
@@ -25,7 +27,7 @@ class TooGoodToGo:
     available_items_favorites = {}
     connected_clients = {}
 
-    def __init__(self, bot_token: str, config: dict = {}):
+    def __init__(self, bot_token: str, config: SectionProxy = {}):
         self.bot = TeleBot(bot_token)
 
         self.__set_config(config)
@@ -40,15 +42,19 @@ class TooGoodToGo:
             types.BotCommand("/info", "favorite bags currently available"),
             types.BotCommand("/login", "log in with your email"),
             types.BotCommand("/settings", "set when you want to be notified"),
-            types.BotCommand("/help", "short explanation"),
+            types.BotCommand("/help", "Help dialog"),
+            types.BotCommand("/sleep", "Silence the bot for a while"),
         ])
     
-    def __set_config(self, config: dict):
+    def __set_config(self, config: SectionProxy):
         self.timezone = timezone(config.get('timezone', 'UTC'))
         print('timezone', self.timezone)
 
         self.language = config.get('language', 'en-GB')
         print('language', self.language)
+        
+        self.date_format = config.get('date_format', '%a %d.%m at %H:%M')
+        print('date_format', self.date_format)
 
         # min 2 default 5
         self.login_timeout_minutes = max(2, int(config.get('login_timeout_minutes', 5)))
@@ -269,6 +275,43 @@ class TooGoodToGo:
                 print(f"API Error [{status}]: {message}")
         else:
             print(f"Unexpected API Error: {err=}")
+
+    def __get_tax_percentage(self, item):
+        tax_map_list = item['item']['sales_taxes']
+        tax_percentage = 0
+        for tax_map in tax_map_list:
+            tax_percentage += tax_map['tax_percentage']
+
+        return tax_percentage / 100
+
+    def __get_price(self, item):
+        item_price_code = item['item']['item_price']['code']
+
+        if item['item']['taxation_policy'] == 'PRICE_DOES_NOT_INCLUDE_TAXES':
+            tax_percentage = self.__get_tax_percentage(item)
+            item_price = self.__get_currency(item['item']['price_excluding_taxes']) * (1 + tax_percentage)
+        else:
+            item_price = self.__get_currency(item['item']['price_including_taxes'])
+
+        item_price_string = format_currency(item_price, item_price_code)
+        return item_price_string
+
+    def __get_value(self, item):
+        item_price_code = item['item']['item_price']['code']
+
+        if item['item']['taxation_policy'] == 'PRICE_DOES_NOT_INCLUDE_TAXES':
+            tax_percentage = self.__get_tax_percentage(item)
+            item_price = self.__get_currency(item['item']['value_excluding_taxes']) * (1 + tax_percentage)
+        else:
+            item_price = self.__get_currency(item['item']['value_including_taxes'])
+
+        item_price_string = format_currency(item_price, item_price_code)
+        return item_price_string
+
+    def __get_currency(self, price_map):
+        currency_decimals = price_map['decimals']
+        currency_minor_units = int(price_map['minor_units'])
+        return currency_minor_units / (10 ** currency_decimals)
     
     def format_item(self, item, status = None, user_id = None) -> str:
         store_name = item['store']['store_name'].strip()
@@ -276,10 +319,9 @@ class TooGoodToGo:
         store_address_line = f"🧭 {item['store']['store_location']['address']['address_line']}"
         store_items_available = item['items_available']
         store_items_available_text = f"🥡 {item['items_available']}"
-        item_price_code = self.__format_price_code(item['item']['item_price']['code'])
-        item_price = f"💰 {int(item['item']['price_including_taxes']['minor_units']) / 100} {item_price_code}"
+        item_price_string = f"💰 {self.__get_price(item)} -- ({self.__get_value(item)} value)"
 
-        item_text = f"{store_name_text}\n{store_address_line}\n{item_price}\n{store_items_available_text}"
+        item_text = f"{store_name_text}\n{store_address_line}\n{item_price_string}\n{store_items_available_text}"
 
         if store_items_available > 0:
             store_pickup_start = self.__format_datetime(item['pickup_interval']['start'])
@@ -295,13 +337,6 @@ class TooGoodToGo:
                 print(f"[{user_id}] {status} {store_items_available_text} 🍽  {store_name} ({item_id})")
         
         return item_text
-    
-    def __format_price_code(self, price_code: str) -> str:
-        if price_code == 'EUR':
-            return '€'
-        if price_code == 'USD':
-            return '$'
-        return price_code
 
     def format_status(self, status: str) -> str:
         return TooGoodToGo.ITEM_STATUS[status]
@@ -317,7 +352,7 @@ class TooGoodToGo:
                     user_settings = self.users_settings_data[user_id]
 
                     # if any alert is enabled for this user
-                    if any(setting == 1 for setting in user_settings.values()):
+                    if not self.is_silenced(user_id) and any(setting == 1 for setting in user_settings.values()):
                         favourite_items = self.get_favourite_items(user_id)
 
                         for item in favourite_items:
@@ -379,9 +414,31 @@ class TooGoodToGo:
         return self.interval_seconds
     
     def __format_datetime(self, datetime_str: str) -> str:
-        return datetime.strptime(datetime_str, '%Y-%m-%dT%H:%M:%SZ') \
-                    .astimezone(self.timezone) \
-                    .strftime("%a %d.%m at %H:%M")
+        return (datetime.strptime(datetime_str, '%Y-%m-%dT%H:%M:%SZ')
+                .replace(tzinfo=utc)
+                .astimezone(self.timezone)
+                .strftime(self.date_format))
+
+    def silence_for_user(self, chat_id, secs=0, minutes=0, hours=0, days=0):
+        now = datetime.now()
+        exp = now + timedelta(seconds=secs, minutes=minutes, hours=hours, days=days)
+
+        self.users_settings_data[chat_id]['silence_exp'] = exp.isoformat()
+        self.save_users_settings_data_to_txt()
+
+
+    def is_silenced(self, chat_id):
+        silence_exp_string = self.users_settings_data[chat_id].get('silence_exp')
+        if silence_exp_string is None:
+            return False
+        silence_exp = datetime.fromisoformat(silence_exp_string)
+        if silence_exp < datetime.now():
+            print(f"{chat_id} Silence has expired. Exp: {silence_exp_string}")
+            del self.users_settings_data[chat_id]['silence_exp']
+            self.save_users_settings_data_to_txt()
+            return False
+        return True
+
 
 def data_file(data_file_name: str, data_folder='data', extension='json') -> Path:
     data_path = Path(f'{data_folder}/{data_file_name}.{extension}')

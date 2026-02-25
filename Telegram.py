@@ -2,6 +2,7 @@ import re
 import configparser
 import asyncio
 from _thread import start_new_thread
+from datetime import datetime
 
 from telebot import types
 from telebot.async_telebot import AsyncTeleBot
@@ -10,13 +11,13 @@ from TooGoodToGo import TooGoodToGo
 
 import tgtg.exceptions
 
-config = configparser.ConfigParser()
+config = configparser.ConfigParser(interpolation=None)
 config.read('config.ini')
 token = config['Telegram']['token']
 bot = AsyncTeleBot(token)
 tooGoodToGo = TooGoodToGo(token, config['Configuration'])
 
-def log_command(chat_id: int, command: str, log: str = ''):
+def log_command(chat_id: str, command: str, log: str = ''):
     print(f"[{chat_id}] /{command}{f': {log}' if log else ''}")
 
 # Handle '/start' and '/help'
@@ -70,10 +71,10 @@ async def send_login(message):
             return None
     except tgtg.exceptions.TgtgAPIError as err:
         tooGoodToGo.handle_api_error(err, chat_id)
-        bot.send_message(chat_id, "❌ Cannot log in. Please try again later.")
+        await bot.send_message(chat_id, "❌ Cannot log in. Please try again later.")
         return None
         
-    email = message.text.replace('/login', '').strip()
+    email = command_param_text(message.text)
 
     if re.match(r"[^@]+@[^@]+\.[^@]+", email):
         log_command(chat_id, 'login', email)
@@ -82,7 +83,7 @@ async def send_login(message):
     else:
         log_command(chat_id, 'login', f'{email} (Invalid)')
         await bot.send_message(chat_id=chat_id,
-                               text="*⚠️ No valid mail address ⚠️*"
+                               text="*⚠️ Invalid mail address ⚠️*"
                                     "\nPlease enter */login email@example.com*"
                                     "\n_You will then receive an email with a confirmation link."
                                     "\nYou do not need to enter a password._",
@@ -136,7 +137,7 @@ async def send_settings(message):
     credentials = tooGoodToGo.find_credentials_by_telegramUserID(chat_id)
     if credentials is None:
         await bot.send_message(chat_id=chat_id,
-                               text="🔑 You have to log in with your mail first!\nPlease enter */login email@example.com*\n*❗️️This is necessary if you want to use the bot❗️*",
+                               text="🔑 You have to log in with your email first!\nPlease enter */login email@example.com*\n*❗️️This is necessary if you want to use the bot❗️*",
                                parse_mode="Markdown")
         return None
 
@@ -203,6 +204,47 @@ async def back_callback(call: types.CallbackQuery):
     await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id,
                                         reply_markup=inline_keyboard_markup(chat_id))
 
-print('TooGoodToGo bot started')
 
-asyncio.run(bot.polling())
+@bot.message_handler(commands=['silence', 'sleep'])
+async def silence(message):
+    chat_id = str(message.chat.id)
+    text = command_param_text(message.text)
+    if not text:
+        log_command(chat_id, 'sleep', 'No sleep value present.')
+        await bot.send_message(text="Please add a timeframe to silence by. Ex: 1 day, 2 hrs", chat_id=chat_id)
+        return
+
+    days = get_regex_int(r'(\d+) ?(:?d|dy|day)s?\b', text.lower())
+    hours = get_regex_int(r'(\d+) ?(:?h|hr|hour)s?\b', text.lower())
+    mins = get_regex_int(r'(\d+) ?(:?m|min|minute)s?\b', text.lower())
+    secs = get_regex_int(r'(\d+) ?(:?s|sec|second)s?\b', text.lower())
+    tooGoodToGo.silence_for_user(chat_id, days=days, hours=hours, minutes=mins, secs=secs)
+
+    silence_exp_time = (datetime.fromisoformat(tooGoodToGo.users_settings_data[chat_id]['silence_exp'])
+                        .strftime(tooGoodToGo.date_format))
+
+    await bot.send_message(text=f"Sleeping until {silence_exp_time}", chat_id=chat_id)
+
+def get_regex_int(pattern, text):
+    match = re.search(pattern, text.lower())
+    if not match:
+        return 0
+    return int(match.group(1))
+
+def command_param_text(text):
+    text_words = text.strip().split(' ')
+    if len(text_words) == 1:
+        return ''
+    return ' '.join(text_words[1:])
+
+print('TooGoodToGo bot started')
+while True:
+    try:
+        asyncio.run(bot.polling())
+    except KeyboardInterrupt:
+        print("Keyboard interrupt received. Shutting Down")
+        break
+    except Exception as e:
+        print("An Exception occurred: ", e)
+        with open("exceptions.log", 'a') as ex_file:
+            print("An Exception occurred: ", e, file=ex_file)
